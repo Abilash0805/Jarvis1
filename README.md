@@ -29,9 +29,15 @@ Pick any of these — all have a free tier or run locally, none need a paid card
 | **Cerebras** | free tier | `CEREBRAS_API_KEY` | https://cloud.cerebras.ai |
 | **OpenRouter** | free models | `OPENROUTER_API_KEY` | https://openrouter.ai/keys |
 | **Mistral** | free tier | `MISTRAL_API_KEY` | https://console.mistral.ai |
+| **Google Gemini** | free tier | `GEMINI_API_KEY` | https://aistudio.google.com/apikey |
 | **Ollama** | 100% local | *(none)* | https://ollama.com |
 
-JARVIS auto-detects whichever key you have. Set one and go:
+**Free-only by default.** JARVIS auto-detects a *free* key and will **refuse to
+touch a paid backend** (OpenAI, Anthropic, Together) unless you explicitly pass
+`--allow-paid`. Paid providers are never auto-selected, so a stray `OPENAI_API_KEY`
+in your environment can never cost you money.
+
+JARVIS auto-detects whichever free key you have. Set one and go:
 
 ```bash
 export GROQ_API_KEY=gsk_...      # or any of the above

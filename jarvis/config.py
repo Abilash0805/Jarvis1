@@ -51,6 +51,10 @@ PROVIDERS: dict[str, ProviderPreset] = {
         "mistral", "openai", "https://api.mistral.ai/v1", "MISTRAL_API_KEY",
         "mistral-large-latest", "Mistral (free tier)", True,
     ),
+    "gemini": ProviderPreset(
+        "gemini", "openai", "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "GEMINI_API_KEY", "gemini-2.0-flash", "Google Gemini (free tier)", True,
+    ),
     "together": ProviderPreset(
         "together", "openai", "https://api.together.xyz/v1", "TOGETHER_API_KEY",
         "meta-llama/Llama-3.3-70B-Instruct-Turbo", "Together AI", False,
@@ -69,12 +73,13 @@ PROVIDERS: dict[str, ProviderPreset] = {
     ),
 }
 
-# Order in which we auto-select a provider from whatever key is present.
-DETECT_ORDER = ["groq", "cerebras", "nvidia", "openrouter", "mistral", "together", "openai", "anthropic"]
+# Auto-detection only ever selects a FREE provider, so a stray paid key
+# (OPENAI_API_KEY, etc.) can never silently route you to a billable service.
+DETECT_ORDER = ["groq", "cerebras", "nvidia", "gemini", "openrouter", "mistral"]
 
 
 def detect_provider() -> str:
-    """Pick a provider from the environment: first free key wins, else local Ollama."""
+    """Pick a free provider from the environment: first free key wins, else local Ollama."""
     env = os.environ.get("JARVIS_PROVIDER")
     if env:
         return env
@@ -82,7 +87,7 @@ def detect_provider() -> str:
         preset = PROVIDERS[name]
         if preset.env_key and os.environ.get(preset.env_key):
             return name
-    return "ollama"  # keyless local default
+    return "ollama"  # keyless local default — always free
 
 
 # -- Anthropic-only capability resolution -----------------------------------
@@ -150,6 +155,7 @@ class Config:
     enable_subagents: bool = True
     max_iterations: int = 50
     subagent_max_depth: int = 2
+    allow_paid: bool = False  # free-only by default; paid backends need an explicit opt-in
     verbose: bool = False
 
     def __post_init__(self) -> None:
@@ -197,6 +203,14 @@ class Config:
     @property
     def label(self) -> str:
         return self.preset.label if self.preset else self.provider
+
+    @property
+    def is_free_provider(self) -> bool:
+        return bool(self.preset and self.preset.free)
+
+    def paid_and_not_allowed(self) -> bool:
+        """True if this backend could cost money and the user hasn't opted in."""
+        return not self.is_free_provider and not self.allow_paid
 
     def ensure_dirs(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)

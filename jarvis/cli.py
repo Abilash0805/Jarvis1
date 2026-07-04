@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--autonomous", action="store_true", help="Skip confirmation prompts (still blocks catastrophic commands)")
     p.add_argument("--no-web", action="store_true", help="Disable keyless web search/fetch")
     p.add_argument("--no-subagents", action="store_true", help="Disable delegation to sub-agents")
+    p.add_argument("--allow-paid", action="store_true", help="Permit a paid backend (off by default — JARVIS is free-only)")
     p.add_argument("--max-iterations", type=int, default=None, help="Agentic loop safety cap (default 50)")
     p.add_argument("--max-tokens", type=int, default=None, help="Max output tokens per turn")
     p.add_argument("--quiet", action="store_true", help="Suppress tool-result panels")
@@ -62,6 +63,7 @@ def make_config(ns: argparse.Namespace) -> Config:
         enable_web=not ns.no_web,
         enable_subagents=not ns.no_subagents,
         max_iterations=ns.max_iterations or 50,
+        allow_paid=bool(ns.allow_paid),
     )
 
 
@@ -69,16 +71,24 @@ def make_config(ns: argparse.Namespace) -> Config:
 
 def list_providers(console: Console) -> int:
     detected = detect_provider()
-    console.rich.print("[bold]Available providers[/bold] (auto-detect order shown first):\n")
-    order = DETECT_ORDER + [n for n in PROVIDERS if n not in DETECT_ORDER]
-    for name in order:
+    free_names = DETECT_ORDER + [n for n in PROVIDERS if PROVIDERS[n].free and n not in DETECT_ORDER]
+    paid_names = [n for n in PROVIDERS if not PROVIDERS[n].free]
+
+    def show(name: str) -> None:
         p = PROVIDERS[name]
         key = f"needs {p.env_key}" if p.env_key else "keyless"
-        free = "[green]free[/green]" if p.free else "[yellow]paid[/yellow]"
         mark = " [cyan]← detected[/cyan]" if name == detected else ""
-        console.rich.print(f"  [bold]{name:11}[/bold] {free:16} {key:22} {p.default_model}{mark}")
-    console.rich.print("\nUse:  jarvis --provider <name> [--model <id>]")
-    console.rich.print("Set the key first, e.g.:  export GROQ_API_KEY=...")
+        console.rich.print(f"  [bold]{name:11}[/bold] {key:24} {p.default_model}{mark}")
+
+    console.rich.print("[bold green]FREE providers[/bold green] (used by default; auto-detect order):\n")
+    for name in free_names:
+        show(name)
+    console.rich.print("\n[bold yellow]PAID providers[/bold yellow] (require --allow-paid; never auto-selected):\n")
+    for name in paid_names:
+        show(name)
+    console.rich.print("\nJARVIS is [bold]free-only[/bold] by default. Set a free key, e.g.:")
+    console.rich.print("  export GROQ_API_KEY=...   # then:  jarvis --autonomous \"...\"")
+    console.rich.print("...or install Ollama (https://ollama.com) for a fully local, keyless run.")
     return 0
 
 
@@ -125,6 +135,19 @@ def _make_agent(cfg: Config, console: Console) -> tuple[Agent, Memory]:
     return Agent(cfg, backend, mem, console), mem
 
 
+def _ensure_free(cfg: Config, console: Console) -> bool:
+    """Refuse a paid backend unless the user explicitly opted in."""
+    if cfg.paid_and_not_allowed():
+        console.error(
+            f"'{cfg.provider}' ({cfg.label}) is a paid backend. JARVIS is free-only by default."
+        )
+        console.info(
+            "Use a free provider (see `jarvis --list-providers`), or pass --allow-paid to override."
+        )
+        return False
+    return True
+
+
 def _preflight(agent: Agent, console: Console) -> bool:
     """Return True if the backend looks ready; print guidance and return False otherwise."""
     problem = agent.backend.health_check()
@@ -135,6 +158,8 @@ def _preflight(agent: Agent, console: Console) -> bool:
 
 
 def run_oneshot(objective: str, cfg: Config, console: Console) -> int:
+    if not _ensure_free(cfg, console):
+        return 1
     agent, mem = _make_agent(cfg, console)
     try:
         if not _preflight(agent, console):
@@ -153,8 +178,11 @@ def run_oneshot(objective: str, cfg: Config, console: Console) -> int:
 
 
 def run_repl(cfg: Config, console: Console) -> int:
+    if not _ensure_free(cfg, console):
+        return 1
+    tier = "free" if cfg.is_free_provider else "PAID"
     console.banner(
-        f"provider={cfg.provider} ({cfg.label})  model={cfg.model}  "
+        f"provider={cfg.provider} ({cfg.label}, {tier})  model={cfg.model}  "
         f"mode={'autonomous' if cfg.autonomous else 'interactive'}  ws={cfg.workspace}"
     )
     console.info("Type your objective. Commands: /help /reset /tasks /memory /exit\n")

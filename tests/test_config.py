@@ -1,4 +1,4 @@
-from jarvis.config import Config, clamp_effort, detect_provider, model_caps
+from jarvis.config import PROVIDERS, Config, clamp_effort, detect_provider, model_caps
 
 
 def test_opus_caps():
@@ -63,3 +63,28 @@ def test_config_custom_endpoint():
     cfg = Config(provider="mylocal", base_url="http://127.0.0.1:9999/v1", workspace=".")
     assert cfg.kind == "openai"
     assert cfg.base_url == "http://127.0.0.1:9999/v1"
+
+
+def test_detection_ignores_paid_keys(monkeypatch):
+    for var in ("JARVIS_PROVIDER", "GROQ_API_KEY", "NVIDIA_API_KEY", "CEREBRAS_API_KEY",
+                "OPENROUTER_API_KEY", "MISTRAL_API_KEY", "GEMINI_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    # A paid key present but no free key → still falls back to free local Ollama.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-paid")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-paid")
+    assert detect_provider() == "ollama"
+
+
+def test_gemini_is_a_free_provider():
+    assert "gemini" in PROVIDERS
+    assert PROVIDERS["gemini"].free is True
+
+
+def test_free_only_gate():
+    assert Config(provider="groq", workspace=".").is_free_provider is True
+    assert Config(provider="ollama", workspace=".").is_free_provider is True
+    # Paid backends are blocked unless explicitly allowed.
+    assert Config(provider="anthropic", workspace=".").paid_and_not_allowed() is True
+    assert Config(provider="openai", workspace=".").paid_and_not_allowed() is True
+    assert Config(provider="anthropic", allow_paid=True, workspace=".").paid_and_not_allowed() is False
+    assert Config(provider="groq", workspace=".").paid_and_not_allowed() is False

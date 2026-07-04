@@ -9,6 +9,7 @@ reasoning output (both a dedicated ``reasoning_content`` field and inline
 from __future__ import annotations
 
 import json
+import urllib.request
 from typing import Any
 
 from ..config import Config
@@ -29,9 +30,23 @@ KEY_HELP = {
     "cerebras": "https://cloud.cerebras.ai",
     "openrouter": "https://openrouter.ai/keys",
     "mistral": "https://console.mistral.ai/api-keys",
+    "gemini": "https://aistudio.google.com/apikey",
     "together": "https://api.together.xyz/settings/api-keys",
     "openai": "https://platform.openai.com/api-keys",
 }
+
+
+def _check_ollama(base_url: str) -> str | None:
+    """Return install guidance if a local Ollama isn't reachable, else None."""
+    root = base_url.rsplit("/v1", 1)[0]
+    try:
+        urllib.request.urlopen(root + "/api/tags", timeout=2)
+        return None
+    except Exception:  # noqa: BLE001 — any failure means "not ready"
+        return (
+            f"Ollama isn't reachable at {root}. It's free — install from "
+            "https://ollama.com, then run `ollama serve` and `ollama pull llama3.1`."
+        )
 
 
 class ThinkRouter:
@@ -158,6 +173,8 @@ class OpenAIBackend(Backend):
             )
 
     def health_check(self) -> str | None:
+        if self.config.provider == "ollama":
+            return _check_ollama(self.config.base_url or "")
         if self.config.needs_key() and not self.config.api_key:
             where = KEY_HELP.get(self.config.provider, "the provider's dashboard")
             return (
