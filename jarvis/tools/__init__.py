@@ -1,4 +1,4 @@
-"""Tool registry — assembles the custom tool surface for an agent."""
+"""Tool registry — assembles the tool surface for an agent."""
 from __future__ import annotations
 
 from ..config import Config
@@ -9,7 +9,7 @@ from .python_exec import PYTHON_TOOLS
 from .shell import SHELL_TOOLS
 from .subagent import SUBAGENT_TOOLS
 from .tasks import TASK_TOOLS, render_tasks
-from .web import web_tool_declarations
+from .web_client import WEB_TOOLS
 
 __all__ = [
     "Tool",
@@ -18,19 +18,20 @@ __all__ = [
     "PathError",
     "ToolRegistry",
     "build_tools",
-    "web_tool_declarations",
     "render_tasks",
 ]
 
 
 def build_tools(config: Config, *, include_subagents: bool = True) -> list[Tool]:
-    """The custom (client-executed) tools available to an agent."""
+    """The tools available to an agent, given its config."""
     tools: list[Tool] = []
     tools += FILESYSTEM_TOOLS
     tools += SHELL_TOOLS
     tools += PYTHON_TOOLS
     tools += MEMORY_TOOLS
     tools += TASK_TOOLS
+    if config.enable_web:
+        tools += WEB_TOOLS  # keyless, works with every backend
     if include_subagents and config.enable_subagents:
         tools += SUBAGENT_TOOLS
     return tools
@@ -48,7 +49,7 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._by_name)
 
-    def custom_schemas(self) -> list[dict]:
+    def schemas(self) -> list[dict]:
         return [t.to_schema() for t in self._by_name.values()]
 
     def overview(self) -> str:

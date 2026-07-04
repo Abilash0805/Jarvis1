@@ -5,34 +5,39 @@ import argparse
 import sys
 from pathlib import Path
 
-import anthropic
-
 from . import __version__
 from .agent import Agent
-from .config import DEFAULT_MODEL, EFFORT_LEVELS, Config
-from .llm import LLMClient
+from .config import DETECT_ORDER, EFFORT_LEVELS, PROVIDERS, Config, detect_provider
 from .memory import Memory
+from .providers import ProviderError, make_backend
 from .ui import Console
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="jarvis",
-        description="JARVIS — a fully autonomous agentic assistant built on the Claude API.",
+        description="JARVIS — a fully autonomous agentic assistant. Runs free on Groq, "
+        "NVIDIA, Cerebras, OpenRouter, Mistral, or a local Ollama.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Memory:  jarvis mem list | search <q> | add <text> | forget <id>\n"
+        "Providers:  jarvis --list-providers",
     )
-    p.add_argument("objective", nargs="*", help="Objective to run once, then exit. Omit for an interactive session.")
-    p.add_argument("--model", default=None, help=f"Claude model (default {DEFAULT_MODEL}; use claude-fable-5 for max capability)")
-    p.add_argument("--effort", default=None, choices=EFFORT_LEVELS, help="Reasoning effort (default high)")
+    p.add_argument("objective", nargs="*", help="Objective to run once, then exit. Omit for a REPL.")
+    p.add_argument("--provider", default=None, help="Provider (default: auto-detect from your keys, else ollama)")
+    p.add_argument("--model", default=None, help="Model id (default: the provider's default)")
+    p.add_argument("--base-url", default=None, help="Override the provider endpoint (for custom/self-hosted)")
+    p.add_argument("--api-key-env", default=None, help="Env var holding the API key (for custom providers)")
+    p.add_argument("--effort", default=None, choices=EFFORT_LEVELS, help="Reasoning effort (Anthropic only)")
     p.add_argument("--workspace", default=None, help="Root directory the agent may touch (default: cwd)")
     p.add_argument("--autonomous", action="store_true", help="Skip confirmation prompts (still blocks catastrophic commands)")
-    p.add_argument("--no-web", action="store_true", help="Disable server-side web search/fetch")
+    p.add_argument("--no-web", action="store_true", help="Disable keyless web search/fetch")
     p.add_argument("--no-subagents", action="store_true", help="Disable delegation to sub-agents")
     p.add_argument("--max-iterations", type=int, default=None, help="Agentic loop safety cap (default 50)")
-    p.add_argument("--max-tokens", type=int, default=None, help="Max output tokens per turn (default 32000)")
+    p.add_argument("--max-tokens", type=int, default=None, help="Max output tokens per turn")
     p.add_argument("--quiet", action="store_true", help="Suppress tool-result panels")
     p.add_argument("--no-thinking", action="store_true", help="Do not stream the model's reasoning")
+    p.add_argument("--list-providers", action="store_true", help="List known providers and exit")
     p.add_argument("--version", action="version", version=f"jarvis {__version__}")
-    p.epilog = "Memory: `jarvis mem list | search <q> | add <text> | forget <id>`"
     return p
 
 
@@ -45,32 +50,36 @@ def build_mem_parser() -> argparse.ArgumentParser:
 
 
 def make_config(ns: argparse.Namespace) -> Config:
-    cfg = Config()
-    if ns.model:
-        cfg.model = ns.model
-    if ns.effort:
-        cfg.effort = ns.effort
-    if ns.workspace:
-        cfg.workspace = Path(ns.workspace)
-    if ns.max_iterations:
-        cfg.max_iterations = ns.max_iterations
-    if ns.max_tokens:
-        cfg.max_tokens = ns.max_tokens
-    cfg.autonomous = bool(ns.autonomous)
-    cfg.enable_web = not ns.no_web
-    cfg.enable_subagents = not ns.no_subagents
-    # Re-resolve derived fields (model caps, effort clamp, resolved paths).
     return Config(
-        model=cfg.model,
-        effort=cfg.effort,
-        max_tokens=cfg.max_tokens,
-        workspace=cfg.workspace,
-        state_dir=cfg.workspace / ".jarvis",
-        autonomous=cfg.autonomous,
-        enable_web=cfg.enable_web,
-        enable_subagents=cfg.enable_subagents,
-        max_iterations=cfg.max_iterations,
+        provider=ns.provider,
+        model=ns.model,
+        base_url=ns.base_url,
+        api_key_env=ns.api_key_env,
+        effort=ns.effort or "high",
+        max_tokens=ns.max_tokens or 4096,
+        workspace=Path(ns.workspace) if ns.workspace else Path.cwd(),
+        autonomous=bool(ns.autonomous),
+        enable_web=not ns.no_web,
+        enable_subagents=not ns.no_subagents,
+        max_iterations=ns.max_iterations or 50,
     )
+
+
+# -- listings ---------------------------------------------------------------
+
+def list_providers(console: Console) -> int:
+    detected = detect_provider()
+    console.rich.print("[bold]Available providers[/bold] (auto-detect order shown first):\n")
+    order = DETECT_ORDER + [n for n in PROVIDERS if n not in DETECT_ORDER]
+    for name in order:
+        p = PROVIDERS[name]
+        key = f"needs {p.env_key}" if p.env_key else "keyless"
+        free = "[green]free[/green]" if p.free else "[yellow]paid[/yellow]"
+        mark = " [cyan]← detected[/cyan]" if name == detected else ""
+        console.rich.print(f"  [bold]{name:11}[/bold] {free:16} {key:22} {p.default_model}{mark}")
+    console.rich.print("\nUse:  jarvis --provider <name> [--model <id>]")
+    console.rich.print("Set the key first, e.g.:  export GROQ_API_KEY=...")
+    return 0
 
 
 # -- memory subcommand ------------------------------------------------------
@@ -90,24 +99,19 @@ def run_mem(ns: argparse.Namespace, cfg: Config, console: Console) -> int:
         if not query:
             console.error("Usage: jarvis mem search <query>")
             return 2
-        recs = mem.search(query, limit=20)
-        if not recs:
-            console.info("No matches.")
-        for r in recs:
+        for r in mem.search(query, limit=20):
             console.rich.print(r.render())
     elif action == "add":
         text = " ".join(ns.args)
         if not text:
             console.error("Usage: jarvis mem add <text>")
             return 2
-        mid = mem.add(text)
-        console.info(f"Added memory #{mid}.")
+        console.info(f"Added memory #{mem.add(text)}.")
     elif action == "forget":
         if not ns.args or not ns.args[0].isdigit():
             console.error("Usage: jarvis mem forget <id>")
             return 2
-        ok = mem.forget(int(ns.args[0]))
-        console.info("Forgotten." if ok else "No such memory.")
+        console.info("Forgotten." if mem.forget(int(ns.args[0])) else "No such memory.")
     mem.close()
     return 0
 
@@ -117,80 +121,75 @@ def run_mem(ns: argparse.Namespace, cfg: Config, console: Console) -> int:
 def _make_agent(cfg: Config, console: Console) -> tuple[Agent, Memory]:
     cfg.ensure_dirs()
     mem = Memory(cfg.memory_path)
-    llm = LLMClient(cfg)
-    agent = Agent(cfg, llm, mem, console)
-    return agent, mem
+    backend = make_backend(cfg)
+    return Agent(cfg, backend, mem, console), mem
 
 
-def _is_auth_error(exc: Exception) -> bool:
-    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
-        return True
-    msg = str(exc).lower()
-    return any(s in msg for s in ("authentication", "api_key", "auth_token", "x-api-key"))
+def _preflight(agent: Agent, console: Console) -> bool:
+    """Return True if the backend looks ready; print guidance and return False otherwise."""
+    problem = agent.backend.health_check()
+    if problem:
+        console.error(problem)
+        return False
+    return True
 
 
 def run_oneshot(objective: str, cfg: Config, console: Console) -> int:
     agent, mem = _make_agent(cfg, console)
     try:
-        result = agent.run(objective)
+        if not _preflight(agent, console):
+            return 1
+        agent.run(objective)
     except KeyboardInterrupt:
         console.warn("Interrupted.")
         return 130
-    except Exception as exc:  # noqa: BLE001 — surface a clean message, not a traceback
-        if _is_auth_error(exc):
-            _auth_help(console)
-            return 1
-        console.error(f"Run failed: {type(exc).__name__}: {exc}")
+    except ProviderError as exc:
+        console.error(str(exc))
         return 1
     finally:
         mem.close()
-    if result:
-        console.rule("done")
+    console.rule("done")
     return 0
 
 
 def run_repl(cfg: Config, console: Console) -> int:
     console.banner(
-        f"model={cfg.model}  effort={cfg.effort}  "
+        f"provider={cfg.provider} ({cfg.label})  model={cfg.model}  "
         f"mode={'autonomous' if cfg.autonomous else 'interactive'}  ws={cfg.workspace}"
     )
-    if not cfg.has_api_credentials():
-        console.info("No ANTHROPIC_API_KEY in env — will use an `ant auth login` profile if present.")
     console.info("Type your objective. Commands: /help /reset /tasks /memory /exit\n")
 
     agent, mem = _make_agent(cfg, console)
+    if not _preflight(agent, console):
+        mem.close()
+        return 1
     session = _input_session()
     try:
         while True:
             try:
-                line = session()
+                line = session().strip()
             except (EOFError, KeyboardInterrupt):
                 console.rich.print()
                 break
-            line = line.strip()
             if not line:
                 continue
             if line.startswith("/"):
-                if _handle_command(line, agent, cfg, console):
+                if _handle_command(line, agent, console):
                     break
                 continue
             try:
                 agent.send(line)
             except KeyboardInterrupt:
                 console.warn("(interrupted — send another message or /exit)")
-            except Exception as exc:  # noqa: BLE001
-                if _is_auth_error(exc):
-                    _auth_help(console)
-                    break
-                console.error(f"{type(exc).__name__}: {exc}")
+            except ProviderError as exc:
+                console.error(str(exc))
     finally:
         mem.close()
     console.info("Goodbye.")
     return 0
 
 
-def _handle_command(line: str, agent: Agent, cfg: Config, console: Console) -> bool:
-    """Handle a /command. Returns True if the REPL should exit."""
+def _handle_command(line: str, agent: Agent, console: Console) -> bool:
     cmd = line[1:].strip().lower()
     if cmd in ("exit", "quit", "q"):
         return True
@@ -203,8 +202,7 @@ def _handle_command(line: str, agent: Agent, cfg: Config, console: Console) -> b
             "  /exit    quit"
         )
     elif cmd == "reset":
-        agent.messages = []
-        agent.state = {}
+        agent.reset()
         console.info("Conversation reset.")
     elif cmd == "tasks":
         console.render_tasks(agent.state.get("tasks", []))
@@ -220,41 +218,30 @@ def _handle_command(line: str, agent: Agent, cfg: Config, console: Console) -> b
 
 
 def _input_session():
-    """Return a callable that reads one line of input (prompt_toolkit if available)."""
     try:
         from prompt_toolkit import PromptSession
         from prompt_toolkit.formatted_text import ANSI
 
         ps = PromptSession()
         return lambda: ps.prompt(ANSI("\033[1;32myou ›\033[0m "))
-    except Exception:
+    except Exception:  # pragma: no cover
         return lambda: input("you › ")
-
-
-def _auth_help(console: Console) -> None:
-    console.error("Authentication failed.")
-    console.info(
-        "Set ANTHROPIC_API_KEY, or run `ant auth login` to use an OAuth profile. "
-        "See https://platform.claude.com/ for an API key."
-    )
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
-    # Route the `mem` subcommand explicitly — argparse can't disambiguate a
-    # free-form `objective` positional from a subparser.
     if argv and argv[0] == "mem":
         ns = build_mem_parser().parse_args(argv[1:])
-        console = Console()
-        cfg = Config(workspace=Path(ns.workspace) if ns.workspace else Path.cwd())
-        cfg = Config(workspace=cfg.workspace, state_dir=cfg.workspace / ".jarvis")
-        return run_mem(ns, cfg, console)
+        ws = Path(ns.workspace) if ns.workspace else Path.cwd()
+        return run_mem(ns, Config(workspace=ws, state_dir=ws / ".jarvis"), Console())
 
     ns = build_parser().parse_args(argv)
     console = Console(quiet=ns.quiet, show_thinking=not ns.no_thinking)
-    cfg = make_config(ns)
+    if ns.list_providers:
+        return list_providers(console)
 
+    cfg = make_config(ns)
     objective = " ".join(ns.objective).strip()
     if objective:
         return run_oneshot(objective, cfg, console)

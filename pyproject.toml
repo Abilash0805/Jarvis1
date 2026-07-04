@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jarvis-agent"
-version = "0.1.0"
-description = "A fully autonomous agentic assistant built on the Anthropic Claude API"
+version = "0.2.0"
+description = "A fully autonomous, provider-agnostic agentic assistant (Groq, NVIDIA, Ollama, and more)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
-    "anthropic>=0.40",
+    "openai>=1.40",
     "rich>=13.0",
     "prompt_toolkit>=3.0",
 ]
@@ -19,6 +19,7 @@ dependencies = [
 jarvis = "jarvis.cli:main"
 
 [project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
 dev = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]

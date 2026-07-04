@@ -1,8 +1,9 @@
-"""Configuration and per-model capability resolution.
+"""Configuration and provider resolution.
 
-The default model is ``claude-opus-4-8``. Set ``--model claude-fable-5`` (or the
-``JARVIS_MODEL`` env var) to run on Anthropic's most capable model; JARVIS adapts
-the request shape automatically (see :func:`model_caps`).
+JARVIS is provider-agnostic. It runs on any OpenAI-compatible endpoint — Groq,
+NVIDIA NIM, Cerebras, OpenRouter, Mistral, or a local Ollama — as well as the
+Anthropic API. The default path is **free**: it auto-detects whichever free
+provider key you have in your environment, or falls back to a local Ollama.
 """
 from __future__ import annotations
 
@@ -10,64 +11,120 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_MODEL = "claude-opus-4-8"
-FALLBACK_MODEL = "claude-opus-4-8"  # refusal fallback target for Fable/Mythos
-
-# Effort levels understood by the API, ordered.
+DEFAULT_MODEL = "claude-opus-4-8"          # only used on the anthropic backend
+FALLBACK_MODEL = "claude-opus-4-8"         # refusal fallback target for Fable/Mythos
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+# -- provider presets -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProviderPreset:
+    name: str
+    kind: str                 # "openai" | "anthropic"
+    base_url: str | None
+    env_key: str | None       # env var holding the API key (None = keyless)
+    default_model: str
+    label: str
+    free: bool
+
+
+PROVIDERS: dict[str, ProviderPreset] = {
+    "groq": ProviderPreset(
+        "groq", "openai", "https://api.groq.com/openai/v1", "GROQ_API_KEY",
+        "llama-3.3-70b-versatile", "Groq (free tier)", True,
+    ),
+    "nvidia": ProviderPreset(
+        "nvidia", "openai", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY",
+        "meta/llama-3.3-70b-instruct", "NVIDIA NIM (free)", True,
+    ),
+    "cerebras": ProviderPreset(
+        "cerebras", "openai", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY",
+        "llama-3.3-70b", "Cerebras (free tier)", True,
+    ),
+    "openrouter": ProviderPreset(
+        "openrouter", "openai", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
+        "meta-llama/llama-3.3-70b-instruct:free", "OpenRouter (free models)", True,
+    ),
+    "mistral": ProviderPreset(
+        "mistral", "openai", "https://api.mistral.ai/v1", "MISTRAL_API_KEY",
+        "mistral-large-latest", "Mistral (free tier)", True,
+    ),
+    "together": ProviderPreset(
+        "together", "openai", "https://api.together.xyz/v1", "TOGETHER_API_KEY",
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo", "Together AI", False,
+    ),
+    "ollama": ProviderPreset(
+        "ollama", "openai", "http://localhost:11434/v1", None,
+        "llama3.1", "Ollama (local, free)", True,
+    ),
+    "openai": ProviderPreset(
+        "openai", "openai", "https://api.openai.com/v1", "OPENAI_API_KEY",
+        "gpt-4o-mini", "OpenAI", False,
+    ),
+    "anthropic": ProviderPreset(
+        "anthropic", "anthropic", None, "ANTHROPIC_API_KEY",
+        DEFAULT_MODEL, "Anthropic (Claude)", False,
+    ),
+}
+
+# Order in which we auto-select a provider from whatever key is present.
+DETECT_ORDER = ["groq", "cerebras", "nvidia", "openrouter", "mistral", "together", "openai", "anthropic"]
+
+
+def detect_provider() -> str:
+    """Pick a provider from the environment: first free key wins, else local Ollama."""
+    env = os.environ.get("JARVIS_PROVIDER")
+    if env:
+        return env
+    for name in DETECT_ORDER:
+        preset = PROVIDERS[name]
+        if preset.env_key and os.environ.get(preset.env_key):
+            return name
+    return "ollama"  # keyless local default
+
+
+# -- Anthropic-only capability resolution -----------------------------------
 
 
 @dataclass(frozen=True)
 class ModelCaps:
-    """What a given model supports, so we build a valid request every time."""
-
     supports_thinking: bool
     supports_effort: bool
     supports_web_tools: bool
-    is_fable_family: bool  # Fable 5 / Mythos 5 — always-on thinking + refusal path
-    max_effort: str  # highest effort level this model accepts
+    is_fable_family: bool
+    max_effort: str
 
 
 def model_caps(model: str) -> ModelCaps:
-    """Resolve capabilities from a model id without a network round-trip.
-
-    Kept deliberately conservative: when in doubt we disable a feature rather
-    than send a request the API will 400.
-    """
+    """Anthropic model capabilities (only consulted on the anthropic backend)."""
     m = model.lower()
     is_fable = m.startswith("claude-fable-") or m.startswith("claude-mythos-")
     is_opus_46plus = any(
-        m.startswith(p)
-        for p in ("claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8")
+        m.startswith(p) for p in ("claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8")
     )
     is_opus_45 = m.startswith("claude-opus-4-5")
     is_sonnet_5 = m.startswith("claude-sonnet-5")
     is_sonnet_46 = m.startswith("claude-sonnet-4-6")
     is_haiku = "haiku" in m
-
-    supports_thinking = is_fable or is_opus_46plus or is_opus_45 or is_sonnet_5 or is_sonnet_46
-    supports_effort = supports_thinking  # same generation gate in practice
-    supports_web = not is_haiku  # server web tools available on current mid/large models
-
-    # `xhigh` exists on Fable/Opus 4.7+/Sonnet 5; `max` on 4.6+/Sonnet families.
+    supports = is_fable or is_opus_46plus or is_opus_45 or is_sonnet_5 or is_sonnet_46
     if is_fable or m.startswith("claude-opus-4-7") or m.startswith("claude-opus-4-8") or is_sonnet_5:
         max_effort = "max"
     elif is_opus_46plus or is_sonnet_46 or is_opus_45:
         max_effort = "max"
     else:
         max_effort = "high"
-
     return ModelCaps(
-        supports_thinking=supports_thinking,
-        supports_effort=supports_effort,
-        supports_web_tools=supports_web,
+        supports_thinking=supports,
+        supports_effort=supports,
+        supports_web_tools=not is_haiku,
         is_fable_family=is_fable,
         max_effort=max_effort,
     )
 
 
 def clamp_effort(effort: str, caps: ModelCaps) -> str:
-    """Clamp a requested effort to what the model accepts."""
     if effort not in EFFORT_LEVELS:
         effort = "high"
     if EFFORT_LEVELS.index(effort) > EFFORT_LEVELS.index(caps.max_effort):
@@ -75,48 +132,82 @@ def clamp_effort(effort: str, caps: ModelCaps) -> str:
     return effort
 
 
+# -- config -----------------------------------------------------------------
+
+
 @dataclass
 class Config:
-    """Everything the agent needs to know before it starts."""
-
-    model: str = DEFAULT_MODEL
+    provider: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
     effort: str = "high"
-    max_tokens: int = 32000
+    max_tokens: int = 4096
     workspace: Path = field(default_factory=Path.cwd)
-    state_dir: Path = field(default_factory=lambda: Path.cwd() / ".jarvis")
+    state_dir: Path | None = None
     autonomous: bool = False
     enable_web: bool = True
     enable_subagents: bool = True
     max_iterations: int = 50
-    subagent_effort: str = "medium"
     subagent_max_depth: int = 2
     verbose: bool = False
 
     def __post_init__(self) -> None:
-        # Environment overrides (flags take precedence — the CLI applies those after).
-        self.model = os.environ.get("JARVIS_MODEL", self.model)
-        self.effort = os.environ.get("JARVIS_EFFORT", self.effort)
-        if "JARVIS_WORKSPACE" in os.environ:
+        if "JARVIS_WORKSPACE" in os.environ and self.workspace == Path.cwd():
             self.workspace = Path(os.environ["JARVIS_WORKSPACE"])
         self.workspace = Path(self.workspace).expanduser().resolve()
+        if self.state_dir is None:
+            self.state_dir = self.workspace / ".jarvis"
         self.state_dir = Path(self.state_dir).expanduser().resolve()
-        self.caps = model_caps(self.model)
-        self.effort = clamp_effort(self.effort, self.caps)
+
+        # Resolve the provider and its preset.
+        if self.provider is None:
+            self.provider = detect_provider()
+        self.preset = PROVIDERS.get(self.provider)
+        if self.preset is None:
+            # Unknown name → generic OpenAI-compatible endpoint (needs --base-url).
+            self.preset = ProviderPreset(
+                self.provider, "openai", self.base_url,
+                self.api_key_env or "OPENAI_API_KEY", "custom", "Custom endpoint", False,
+            )
+
+        self.kind = self.preset.kind
+        if self.model is None:
+            self.model = os.environ.get("JARVIS_MODEL") or self.preset.default_model
+        if self.base_url is None:
+            self.base_url = os.environ.get("JARVIS_BASE_URL") or self.preset.base_url
+        if self.api_key_env is None:
+            self.api_key_env = self.preset.env_key
+        self.api_key: str | None = (
+            os.environ.get("JARVIS_API_KEY")
+            or (os.environ.get(self.api_key_env) if self.api_key_env else None)
+        )
+
+        # Anthropic capabilities (unused by the openai backend).
+        if self.kind == "anthropic":
+            self.caps = model_caps(self.model)
+            self.effort = clamp_effort(self.effort, self.caps)
+        else:
+            self.caps = ModelCaps(False, False, False, False, "high")
 
     @property
     def memory_path(self) -> Path:
         return self.state_dir / "memory.db"
 
+    @property
+    def label(self) -> str:
+        return self.preset.label if self.preset else self.provider
+
     def ensure_dirs(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
-    def has_api_credentials(self) -> bool:
-        """True if an API key is present in the environment.
+    def needs_key(self) -> bool:
+        return bool(self.api_key_env) and self.kind != "anthropic"
 
-        Absence does NOT mean there are no credentials — an ``ant auth login``
-        profile also works. We only use this to print a friendlier hint.
-        """
-        return bool(
-            os.environ.get("ANTHROPIC_API_KEY")
-            or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-        )
+    def has_credentials(self) -> bool:
+        """Keyless providers (Ollama) always pass; others need a key present."""
+        if self.provider == "ollama":
+            return True
+        if self.kind == "anthropic":
+            return bool(self.api_key or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+        return bool(self.api_key)

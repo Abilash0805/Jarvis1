@@ -1,25 +1,20 @@
-"""The agentic loop.
+"""The agentic loop — provider-agnostic.
 
-An :class:`Agent` runs an open-ended plan→act→verify loop: it calls the model,
-renders thinking and text live, executes the tools the model asks for, feeds the
-results back, and repeats until the model is done (or a safety cap trips). It
-can delegate self-contained subtasks to sub-agents.
+An :class:`Agent` drives a :class:`Backend` (any provider) through a plan → act →
+verify loop: run a turn, render thinking + text live, execute the tools the model
+asked for, feed the results back, and repeat until the model is done. It can
+delegate self-contained subtasks to sub-agents.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Callable
 
 from .config import Config
-from .llm import LLMClient, StreamCallbacks
 from .memory import Memory
 from .prompts import SUBAGENT_PROMPT, system_prompt
-from .tools import (
-    PathError,
-    ToolContext,
-    ToolRegistry,
-    build_tools,
-    web_tool_declarations,
-)
+from .providers import AssistantTurn, Backend, StreamCallbacks, make_backend
+from .providers.base import ToolResultMsg
+from .tools import PathError, ToolContext, ToolRegistry, build_tools
 from .ui import Console
 
 
@@ -27,24 +22,36 @@ class Agent:
     def __init__(
         self,
         config: Config,
-        llm: LLMClient,
+        backend: Backend,
         memory: Memory,
         console: Console,
         *,
         depth: int = 0,
+        backend_factory: Callable[[], Backend] | None = None,
     ):
         self.config = config
-        self.llm = llm
+        self.backend = backend
         self.memory = memory
         self.console = console
         self.depth = depth
+        self.backend_factory = backend_factory or (lambda: make_backend(config))
         include_sub = depth + 1 < config.subagent_max_depth
         self.registry = ToolRegistry(build_tools(config, include_subagents=include_sub))
-        self.messages: list[dict[str, Any]] = []
-        self.state: dict[str, Any] = {}
-        self._system: str | None = None
+        self.state: dict = {}
+        self._configured = False
 
-    # -- context / tools ----------------------------------------------------
+    # -- setup --------------------------------------------------------------
+
+    def _configure(self, *, memory_digest: str = None) -> None:
+        digest = self.memory.digest() if memory_digest is None else memory_digest
+        system = system_prompt(
+            workspace=self.config.workspace,
+            autonomous=self.config.autonomous,
+            tools_overview=self.registry.overview(),
+            memory_digest=digest,
+        )
+        self.backend.configure(system, self.registry.schemas())
+        self._configured = True
 
     def _ctx(self) -> ToolContext:
         return ToolContext(
@@ -62,151 +69,97 @@ class Agent:
     def _confirm(self, action: str) -> bool:
         return True if self.config.autonomous else self.console.confirm(action)
 
-    def _api_tools(self) -> list[dict]:
-        tools = self.registry.custom_schemas()
-        if self.config.enable_web and self.config.caps.supports_web_tools:
-            tools += web_tool_declarations()
-        return tools
-
-    def _build_system(self) -> str:
-        if self._system is None:
-            self._system = system_prompt(
-                workspace=self.config.workspace,
-                autonomous=self.config.autonomous,
-                tools_overview=self.registry.overview(),
-                memory_digest=self.memory.digest(),
-            )
-        return self._system
-
-    # -- public entry points ------------------------------------------------
+    # -- entry points -------------------------------------------------------
 
     def run(self, objective: str) -> str:
-        """Fresh objective (one-shot). Returns the final text."""
-        self.messages = [{"role": "user", "content": objective}]
-        return self._loop(self._build_system())
+        if not self._configured:
+            self._configure()
+        self.backend.reset()
+        self.backend.add_user_message(objective)
+        return self._loop()
 
     def send(self, user_message: str) -> str:
-        """Continue an ongoing conversation (REPL)."""
-        self.messages.append({"role": "user", "content": user_message})
-        return self._loop(self._build_system())
+        if not self._configured:
+            self._configure()
+        self.backend.add_user_message(user_message)
+        return self._loop()
+
+    def reset(self) -> None:
+        self.backend.reset()
+        self.state = {}
 
     # -- the loop -----------------------------------------------------------
 
-    def _loop(self, system: str) -> str:
-        tools = self._api_tools()
-        effort = self.config.subagent_effort if self.depth > 0 else self.config.effort
-        max_tokens = 16000 if self.depth > 0 else self.config.max_tokens
-        final_text = ""
+    def _loop(self) -> str:
         callbacks = StreamCallbacks(
             on_thinking=self.console.stream_thinking,
             on_text=self.console.stream_text,
         )
-
+        final_text = ""
         for _ in range(self.config.max_iterations):
-            msg = self.llm.complete(
-                messages=self.messages,
-                system=system,
-                tools=tools,
-                callbacks=callbacks,
-                effort=effort,
-                max_tokens=max_tokens,
-            )
+            turn = self.backend.run(callbacks)
             self.console.end_stream()
-            self.messages.append({"role": "assistant", "content": msg.content})
+            if turn.text:
+                final_text = turn.text
 
-            text = _text_of(msg)
-            if text:
-                final_text = text
-
-            stop = msg.stop_reason
-            if stop == "refusal":
-                detail = _refusal_detail(msg)
-                self.console.error(f"Request refused by safety policy.{detail}")
+            if turn.stop_reason == "refusal":
+                cat = f" (category: {turn.refusal_category})" if turn.refusal_category else ""
+                self.console.error(f"The model refused this request.{cat}")
                 return final_text or "(request refused)"
 
-            if stop == "tool_use":
-                results = self._execute_tools(msg)
-                self.messages.append({"role": "user", "content": results})
+            if turn.tool_calls:
+                results = self._execute_tools(turn)
+                self.backend.add_tool_results(results)
                 continue
 
-            if stop == "pause_turn":
-                # Server-side tool (e.g. web search) hit its per-turn cap; resume.
+            if turn.stop_reason == "pause_turn":
+                continue  # server-side tool (Anthropic) — resume
+
+            if turn.stop_reason == "max_tokens":
+                self.backend.add_user_message("Your response was cut off — continue where you stopped.")
                 continue
 
-            if stop == "max_tokens":
-                self.messages.append(
-                    {"role": "user", "content": "Your response was cut off. Continue from where you stopped."}
-                )
-                continue
-
-            # end_turn / stop_sequence
             break
         else:
-            self.console.warn(
-                f"Reached the {self.config.max_iterations}-iteration safety cap."
-            )
+            self.console.warn(f"Reached the {self.config.max_iterations}-iteration safety cap.")
         return final_text
 
-    def _execute_tools(self, msg: Any) -> list[dict[str, Any]]:
+    def _execute_tools(self, turn: AssistantTurn) -> list[ToolResultMsg]:
         ctx = self._ctx()
-        results: list[dict[str, Any]] = []
-        for block in msg.content:
-            if getattr(block, "type", None) != "tool_use":
-                continue  # server tools already ran server-side
-            name = block.name
-            args = block.input or {}
-            self.console.tool_call(name, args)
-            tool = self.registry.get(name)
+        results: list[ToolResultMsg] = []
+        for call in turn.tool_calls:
+            self.console.tool_call(call.name, call.args)
+            tool = self.registry.get(call.name)
             if tool is None:
-                content, is_error = f"Unknown tool: {name}", True
+                content, is_error = f"Unknown tool: {call.name}", True
             else:
                 try:
-                    res = tool.run(args, ctx)
+                    res = tool.run(call.args, ctx)
                     content, is_error = res.content, res.is_error
                 except PathError as e:
                     content, is_error = str(e), True
-                except Exception as e:  # a tool bug must not crash the loop
-                    content, is_error = f"Tool '{name}' raised: {e}", True
-            self.console.tool_result(name, content, is_error)
-            results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": content,
-                    "is_error": is_error,
-                }
-            )
+                except Exception as e:  # noqa: BLE001 — a tool bug must not crash the loop
+                    content, is_error = f"Tool '{call.name}' raised: {e}", True
+            self.console.tool_result(call.name, content, is_error)
+            results.append(ToolResultMsg(id=call.id, name=call.name, content=content, is_error=is_error))
         return results
 
     # -- delegation ---------------------------------------------------------
 
     def _delegate(self, objective: str, extra_context: str) -> str:
         self.console.rule(f"sub-agent (depth {self.depth + 1})")
-        sub = Agent(self.config, self.llm, self.memory, self.console, depth=self.depth + 1)
+        sub = Agent(
+            self.config,
+            self.backend_factory(),
+            self.memory,
+            self.console,
+            depth=self.depth + 1,
+            backend_factory=self.backend_factory,
+        )
+        sub._configure(memory_digest="")
         first = SUBAGENT_PROMPT.format(workspace=self.config.workspace, objective=objective)
         if extra_context.strip():
             first += f"\n\nContext from the orchestrator:\n{extra_context}"
-        sub.messages = [{"role": "user", "content": first}]
-        report = sub._loop(
-            system_prompt(
-                workspace=self.config.workspace,
-                autonomous=self.config.autonomous,
-                tools_overview=sub.registry.overview(),
-                memory_digest="",
-            )
-        )
+        report = sub.run(first)
         self.console.rule("resume")
         return report or "(sub-agent produced no report)"
-
-
-def _text_of(msg: Any) -> str:
-    parts = [b.text for b in msg.content if getattr(b, "type", None) == "text"]
-    return "\n".join(p for p in parts if p).strip()
-
-
-def _refusal_detail(msg: Any) -> str:
-    details = getattr(msg, "stop_details", None)
-    if details is None:
-        return ""
-    cat = getattr(details, "category", None)
-    return f" (category: {cat})" if cat else ""

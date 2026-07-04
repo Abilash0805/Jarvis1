@@ -1,13 +1,13 @@
 """Shared test fixtures and fakes."""
 import io
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from rich.console import Console as RichConsole
 
 from jarvis.config import Config
 from jarvis.memory import Memory
+from jarvis.providers.base import AssistantTurn, Backend, ToolCall
 from jarvis.tools.base import ToolContext
 from jarvis.ui import Console
 
@@ -19,8 +19,9 @@ def workspace(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def config(workspace: Path) -> Config:
+    # Keyless local provider keeps the fixture deterministic and offline.
     return Config(
-        model="claude-opus-4-8",
+        provider="ollama",
         workspace=workspace,
         state_dir=workspace / ".jarvis",
         autonomous=True,
@@ -57,31 +58,49 @@ def ctx(config: Config, memory: Memory, console: Console) -> ToolContext:
     )
 
 
-# -- fakes for the agent loop ----------------------------------------------
+# -- backend fakes for the agent loop --------------------------------------
 
-def text_block(text):
-    return SimpleNamespace(type="text", text=text)
-
-
-def tool_block(block_id, name, args):
-    return SimpleNamespace(type="tool_use", id=block_id, name=name, input=args)
-
-
-def fake_message(content, stop_reason, stop_details=None):
-    return SimpleNamespace(content=content, stop_reason=stop_reason, stop_details=stop_details)
+def turn(text="", tool_calls=None, stop_reason=None, refusal_category=None) -> AssistantTurn:
+    calls = tool_calls or []
+    stop = stop_reason or ("tool_use" if calls else "end_turn")
+    return AssistantTurn(
+        text=text, tool_calls=calls, stop_reason=stop, refusal_category=refusal_category
+    )
 
 
-class FakeLLM:
-    """Returns scripted messages in order; records the kwargs of each call."""
+def tcall(call_id, name, args) -> ToolCall:
+    return ToolCall(id=call_id, name=name, args=args)
 
-    def __init__(self, scripted):
-        self.scripted = list(scripted)
-        self.calls = []
 
-    def complete(self, **kwargs):
-        # Snapshot the messages list — the agent mutates it in place, and the
-        # real SDK serializes it at call time, so tests must see a point-in-time copy.
-        snapshot = dict(kwargs)
-        snapshot["messages"] = list(kwargs.get("messages", []))
-        self.calls.append(snapshot)
-        return self.scripted.pop(0)
+class FakeBackend(Backend):
+    """Returns scripted AssistantTurns; records the neutral message log."""
+
+    label = "fake"
+    model = "fake-model"
+
+    def __init__(self, turns):
+        self.turns = list(turns)
+        self.log = []  # ("user"|"tool"|"assistant", payload)
+        self.system = None
+        self.tools = None
+        self.calls = 0
+
+    def configure(self, system, tools):
+        self.system, self.tools = system, tools
+
+    def reset(self):
+        self.log = []
+
+    def add_user_message(self, text):
+        self.log.append(("user", text))
+
+    def add_tool_results(self, results):
+        self.log.append(("tool", results))
+
+    def run(self, callbacks):
+        self.calls += 1
+        t = self.turns.pop(0)
+        if t.text:
+            callbacks.text(t.text)
+        self.log.append(("assistant", t))
+        return t

@@ -1,3 +1,6 @@
-anthropic>=0.40
+openai>=1.40
 rich>=13.0
 prompt_toolkit>=3.0
+
+# Optional — only needed for `--provider anthropic`:
+# anthropic>=0.40
